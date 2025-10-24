@@ -68,8 +68,8 @@ CONFIG = {
 
     # ---------- Parallel search ----------
     "threads": 8,                      # ThreadPool size (5800X3D -> 16 logical threads)
-    "random_starts": 96,                # Starts per class-split (raise cautiously)
-    "hill_steps": 5000,                 # Swap attempts per start
+    "random_starts": 2,                # Starts per class-split (raise cautiously)
+    "hill_steps": 2000,                 # Swap attempts per start
     "seed": None,                         # RNG seed (or None)
 
     # ---------- Class-count splits (dots, dashes) ----------
@@ -84,7 +84,7 @@ CONFIG = {
     # ---------- Morse n-gram targets ----------
     "targets_top_words": 2500,          # Top-N corpus words to convert to Morse targets
     "targets_min_len": 1,               # Minimum Morse length of target
-    "targets_max_len": 7,              # Maximum Morse length (longer => more compute)
+    "targets_max_len": 4,              # Maximum Morse length (longer => more compute)
     "ngram_weight_alpha": 1.3,          # Weight(L) = L ** alpha (favor longer n-grams)
     "ngram_weight_norm": True,          # Normalize weights across lengths
 
@@ -92,9 +92,9 @@ CONFIG = {
     "early_stop_score": 0.996,          # Stop a start if score exceeds this
 
     # ---------- Consensus refinement ----------
-    "topK_global": 48,                  # Top-K mappings gathered from parallel starts
+    "topK_global": 20,                  # Top-K mappings gathered from parallel starts
     "consensus_rounds": 3,              # Refinement iterations
-    "consensus_top_from_each_round": 40,# Carry this many into the next round
+    "consensus_top_from_each_round": 20,# Carry this many into the next round
     "parent_pool": 16,                  # Parents considered for crossover
     "children_per_pair": 2,             # Children spawned per parent pair
     "neighbors_per_map": 800,          # Local neighbor proposals per mapping per round
@@ -552,122 +552,85 @@ def refine_consensus(cipher: str, symbols: List[str], splits: List[Tuple[int,int
       - build consensus for nearby class-count splits
       - spawn crossover children + repair
       - hill-climb neighbors
-      - re-rank and repeat
+      - re-rank, dedupe, and repeat
     """
-    pool = initial_results[:cfg["topK_global"]]
-    best = pool[0]
+    # Start from best K from the parallel phase
+    pool: List[Tuple[float, Dict[str,str], str, str]] = initial_results[:cfg["topK_global"]]
+    symbols_sorted = sorted(symbols)
 
-    for rnd in range(cfg["consensus_rounds"]):
+    def dedupe_keep_best(items: List[Tuple[float, Dict[str,str], str, str]],
+                         cap: int) -> List[Tuple[float, Dict[str,str], str, str]]:
+        seen = {}
+        for s, m, p, morse in items:
+            key = tuple(sorted(m.items()))
+            if key not in seen or s > seen[key][0]:
+                seen[key] = (s, m, p, morse)
+        return sorted(seen.values(), key=lambda x: x[0], reverse=True)[:cap]
+
+    best = max(pool, key=lambda x: x[0])
+
+    for _round in range(cfg["consensus_rounds"]):
         new_candidates: List[Tuple[float, Dict[str,str], str, str]] = []
 
         for (nd, nh) in splits:
-            # keep parents that roughly match counts
-            filtered_pairs = [(s, m) for (s, m, _, _) in pool
-                              if abs(mapping_class_counts(m)[0]-nd) <= 2 and abs(mapping_class_counts(m)[1]-nh) <= 2]
+            # Keep parents whose dot/dash counts are close to this split
+            filtered_pairs: List[Tuple[float, Dict[str,str]]] = []
+            for s, m, p, morse in pool:
+                d, h, q = mapping_class_counts(m)
+                if abs(d - nd) <= 2 and abs(h - nh) <= 2:
+                    filtered_pairs.append((s, m))
             if not filtered_pairs:
                 continue
 
-            symbols_sorted = sorted(symbols)
-            target_counts = (nd, nh, max(0, len(symbols)-nd-nh))
+            target_counts = (nd, nh, max(0, len(symbols_sorted) - nd - nh))
 
-            # consensus
+            # ----- Consensus mapping (weighted per-symbol vote) -----
             consensus_map = consensus_mapping(symbols_sorted, filtered_pairs, target_counts,
                                               min_vote=cfg["consensus_symbol_min_vote"])
-            consensus_map = repair_class_counts(consensus_map, target_counts, symbols_sorted, cfg["repair_max_swaps"])
+            consensus_map = repair_class_counts(consensus_map, target_counts, symbols_sorted,
+                                                cfg["repair_max_swaps"])
             s0, p0, morse0 = score_mapping(cipher, consensus_map, word_freq, bigr,
-                                           cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt)
+                                           cfg["lm_word_weight"], cfg["lm_char_weight"],
+                                           cfg["word_min_len"], tgt)
             new_candidates.append((s0, consensus_map, p0, morse0))
 
-            # votes to guide crossover
-            wsum = sum(max(0.0, sc) for sc, _ in filtered_pairs) + 1e-9
-            votes = {sym: {'.':0.0, '-':0.0, '/':0.0} for sym in symbols_sorted}
+            # ----- Votes to guide crossover -----
+            wsum = sum(max(0.0, sc) for sc, _m in filtered_pairs) + 1e-9
+            votes = {sym: {'.': 0.0, '-': 0.0, '/': 0.0} for sym in symbols_sorted}
             for sc, mp in filtered_pairs:
                 w = max(0.0, sc) / wsum
                 for sym in symbols_sorted:
                     votes[sym][mp.get(sym, '/')] += w
 
-            # crossover
-            parents = [m for _, m in pool[:cfg["parent_pool"]]]
-            pairs = []
-            for i in range(min(len(parents), cfg["parent_pool"])):
-                for j in range(i+1, min(len(parents), cfg["parent_pool"])):
-                    pairs.append((parents[i], parents[j]))
-            random.shuffle(pairs)
-            pairs = pairs[:max(1, cfg["parent_pool"]//2)]
-
-            children = []
-            for pa, pb in pairs:
-                for _ in range(cfg["children_per_pair"]):
-                    child = crossover_child(pa, pb, symbols_sorted, votes=votes)
-                    child = repair_class_counts(child, target_counts, symbols_sorted, cfg["repair_max_swaps"])
-                    children.append(child)
-
-            # local neighbor refinement
-            with cf.ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
-                futs = []
-                seeds = [consensus_map] + children
-                for m0 in seeds:
-                    futs.append(ex.submit(score_mapping, cipher, m0, word_freq, bigr,
-                                          cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt))
-                    # neighbors
-                    neighs = neighbors_swaps(m0, symbols_sorted, k=cfg["neighbors_per_map"])
-                    for nm in neighs:
-                        futs.append(ex.submit(score_mapping, cipher, nm, word_freq, bigr,
-                                              cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt))
-                for fut in cf.as_completed(futs):
-                    try:
-                        s, p, morse = fut.result()
-                        new_candidates.append((s, None, p, morse))  # map to be filled later
-                    except Exception as e:
-                        pass
-
-            # backfill mappings for those without map (re-score cheaper than storing huge list)
-            filled = []
-            for s, m, p, morse in new_candidates:
-                if m is None:
-                    # re-derive by hill climbing a few steps from consensus (cheap heuristic)
-                    # (or skip; but we prefer to know mapping—here we’ll skip to keep RAM sane)
-                    filled.append((s, consensus_map, p, morse))
-                else:
-                    filled.append((s, m, p, morse))
-            new_candidates = filled
-
-            # votes to guide crossover (use only filtered parents that roughly match this split)
-            wsum = sum(max(0.0, sc) for sc, _ in filtered_pairs) + 1e-9
-            votes = {sym: {'.':0.0, '-':0.0, '/':0.0} for sym in symbols_sorted}
-            for sc, mp in filtered_pairs:
-                w = max(0.0, sc) / wsum
-                for sym in symbols_sorted:
-                    votes[sym][mp.get(sym, '/')] += w
-
-            # parent pool (mappings only) drawn from filtered pool to keep counts coherent
-            parent_maps = [m for (sc, m) in filtered_pairs][:cfg["parent_pool"]]
+            # ----- Parent pool & pairs (mappings only) -----
+            parent_maps: List[Dict[str,str]] = [m for (_sc, m) in filtered_pairs][:cfg["parent_pool"]]
             n_par = len(parent_maps)
-            pairs = [(parent_maps[i], parent_maps[j]) for i in range(n_par) for j in range(i+1, n_par)]
-            random.shuffle(pairs)
-            # limit number of parent pairs to try
-            max_pairs = max(1, min(len(pairs), cfg["parent_pool"] // 2))
-            pairs = pairs[:max_pairs]
+            if n_par >= 2:
+                pairs = [(parent_maps[i], parent_maps[j]) for i in range(n_par) for j in range(i+1, n_par)]
+                random.shuffle(pairs)
+                max_pairs = max(1, min(len(pairs), cfg["parent_pool"] // 2))
+                pairs = pairs[:max_pairs]
+            else:
+                pairs = []
 
-            children = []
+            # ----- Children via crossover + repair -----
+            children: List[Dict[str,str]] = []
             for pa, pb in pairs:
                 for _ in range(cfg["children_per_pair"]):
                     child = crossover_child(pa, pb, symbols_sorted, votes=votes)
                     child = repair_class_counts(child, target_counts, symbols_sorted, cfg["repair_max_swaps"])
                     children.append(child)
 
-            # local neighbor refinement (keep mapping attached to each future)
+            # ----- Local neighbor refinement (mapping stays attached) -----
+            seeds = [consensus_map] + children
             with cf.ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
-                futs = []
-                seeds = [consensus_map] + children
+                futs: List[Tuple[Dict[str,str], "cf.Future"]] = []
                 for m0 in seeds:
                     futs.append((m0, ex.submit(
                         score_mapping, cipher, m0, word_freq, bigr,
                         cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
                     )))
-                    # neighbors
-                    neighs = neighbors_swaps(m0, symbols_sorted, k=cfg["neighbors_per_map"])
-                    for nm in neighs:
+                    for nm in neighbors_swaps(m0, symbols_sorted, k=cfg["neighbors_per_map"]):
                         futs.append((nm, ex.submit(
                             score_mapping, cipher, nm, word_freq, bigr,
                             cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
@@ -677,26 +640,15 @@ def refine_consensus(cipher: str, symbols: List[str], splits: List[Tuple[int,int
                         s, p, morse = fut.result()
                         new_candidates.append((s, m_candidate, p, morse))
                     except Exception:
-                        pass
+                        pass  # ignore failed evaluations
 
-            # backfill mappings for those without map (re-score cheaper than storing huge list)
-            filled = []
-            for s, m, p, morse in new_candidates:
-                if m is None:
-                    # re-derive by hill climbing a few steps from consensus (cheap heuristic)
-                    # (or skip; but we prefer to know mapping—here we’ll skip to keep RAM sane)
-                    filled.append((s, consensus_map, p, morse))
-                else:
-                    filled.append((s, m, p, morse))
-            new_candidates = filled
-
-        # merge and keep top
-        pool = sorted(pool + new_candidates, key=lambda x: x[0], reverse=True)
-        pool = pool[:cfg["consensus_top_from_each_round"]]
+        # Merge old & new, dedupe by mapping, keep top N
+        pool = dedupe_keep_best(pool + new_candidates, cfg["consensus_top_from_each_round"])
         if pool and pool[0][0] > best[0]:
             best = pool[0]
 
     return best  # (score, mapping, plaintext, morse)
+
 
 # =======================
 # Main

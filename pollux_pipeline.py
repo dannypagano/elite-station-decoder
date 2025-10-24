@@ -1,1062 +1,867 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pollux Cipher Combined Pipeline (Decoder + Optimizer)
-- Threaded scan and optimizer
-- GPU/NumPy-accelerated scoring (PyTorch CUDA/MPS or NumPy)
-- Bounded merge iterations and pool sizes
-- Config-driven (no CLI flags)
+Pollux Cipher decoder — multithreaded + GPU-aware (CUDA/ROCm/MPS) with:
+- length-weighted Morse n-gram scoring (longer n-grams count more)
+- parallel random-start hill-climb search (CPU threads)
+- consensus + crossover + repair + local refinement across iterations
+- hotspot-centered preview (shows the region with the densest n-gram matches)
+- priors to avoid slash-heavy (separator-heavy) mappings
+- CSV export of top candidates (initial + refined), with hotspot-centered previews per row
+
+Optimized defaults for:
+- Debian VM on Windows, 16 GB RAM
+- AMD Ryzen 7 5800X3D (8C/16T) -> threads=16
+- AMD RX 6750 XT via PCIe passthrough (ROCm PyTorch) -> GPU scorer if available
+
+If ROCm/CUDA/MPS isn't available, falls back to NumPy; else pure Python.
 """
 
-# ======= CONFIG (edit me) =======
-CONFIG = {
-    # ---------- Inputs ----------
-    "corpus": "./corpus",                     # Folder with *.txt files for building n-grams
-    "ciphertext": None,                       # Paste ciphertext here (if set, overrides file)
-    "ciphertext_file": "./cipher.txt",        # File path used when ciphertext is None
-
-    # ---------- Concurrency ----------
-    "threads": 8,                              # Thread workers for optimizer & scan (good default on M3 Air)
-    "max_workers": 8,                          # Decoder scanning threads for chunked search
-
-    # ---------- N-gram model (smaller = faster for quick tests) ----------
-    "nmin": 1,                                 # Minimum n-gram length
-    "nmax": 7,                                 # Maximum n-gram length (≤3 is much faster than 4–5)
-    "topk": 10000,                              # Keep top-K most frequent n-grams
-    "min_count": 3,                            # Drop n-grams below this frequency (noise filter)
-    "min_token_len": 3,                        # Drop tokens shorter than this many characters
-
-    # ---------- Decoder scanning ----------
-    "chunk_size": 20000,                       # Cipher chunk size; 11k fits in one chunk (fine to keep)
-    "max_per_word_candidates": 50,              # Cap: keep at most this many candidate windows per word
-
-    # ---------- Merge (key limits to keep it bounded) ----------
-    "max_merge_iter": 100,                       # Hard cap on merge iterations
-    "max_merged_pool": 50000,                  # After each merge iteration, keep only top-N mappings
-
-    # ---------- Constraints from decoder -> optimizer ----------
-    "take_top_cands": 500,                      # Use top-N decoder mappings to form symbol constraints
-    "require_unanimous": True,                 # Only keep a constraint if all top-N agree
-
-    # ---------- Optimizer (quick test run) ----------
-    "opt_max_evals": 50000,                    # Max mapping evaluations (raise later after calibration)
-    "opt_threshold": 0.983,                    # Early-stop threshold for “good enough”
-
-    # ---------- Target set for optimizer ----------
-    "targets_top_ngram": 5000,                  # Use Morse of top-N n-grams as additional targets
-}
-# =================================
-
-# ==== BEGIN Embedded: PolluxDecoder.py ====
-#!/usr/bin/env python3
-"""
-Optimized decode pipeline:
-- builds n-grams from corpus
-- parallel chunk scanning for candidate windows
-- aggressive merging of partial mappings
-- decode + fast Aho-Corasick scoring of decoded candidates
-- export top results to CSV
-
-Drop-in, pure-Python (no external libraries required).
-"""
-
-import os
-import glob
-import csv
-import pprint
-import time
-from datetime import datetime
-from collections import defaultdict, Counter, deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Dict, Tuple
-
-# ---------------------------
-# Configuration
-# ---------------------------
-CORPUS_FOLDER = r"corpus"
-MESSAGE_PATH = r"message.txt"
-OUTPUT_DIR = r"output"
-NGRAM_RANGE = (1, 5)
-TOP_K_NGRAMS = 5000
-MIN_COUNT = 2
-MIN_TOKEN_LEN = 3
-
-CHUNK_SIZE = 20000
-MAX_WORKERS = 8
-
-EXPORT_K = 30000
-
-# ---------------------------
-# Morse dictionary + allowed chars
-# ---------------------------
-MORSE = {
-    'a': '.-', 'b': '-...', 'c': '-.-.', 'd': '-..', 'e': '.',
-    'f': '..-.', 'g': '--.', 'h': '....', 'i': '..', 'j': '.---',
-    'k': '-.-', 'l': '.-..', 'm': '--', 'n': '-.', 'o': '---',
-    'p': '.--.', 'q': '--.-', 'r': '.-.', 's': '...', 't': '-',
-    'u': '..-', 'v': '...-', 'w': '.--', 'x': '-..-', 'y': '-.--',
-    'z': '--..',
-    '0': '-----','1': '.----','2': '..---','3': '...--','4': '....-',
-    '5': '.....','6': '-....','7': '--...','8': '---..','9': '----.',
-    '.': '.-.-.-', ',': '--..--', '?': '..--..', '!': '-.-.--'
-}
-
-ALLOWED_CHARS = set(MORSE.keys()) | {" "}
-LETTER_SEP = '|'
-WORD_SEP = '||'
-
-# ---------------------------
-# Lightweight Aho-Corasick (pure Python)
-# ---------------------------
-# Build automaton from patterns -> returns an object with `find_all(text)` yielding (end_index, matched_pattern)
-class AhoCorasick:
-    def __init__(self, patterns: List[str]):
-        # patterns should be lowercased
-        self._build_trie(patterns)
-
-    def _build_trie(self, patterns: List[str]):
-        # trie: each node is dict char -> node_index
-        # output: node_index -> list of patterns ending at that node
-        self.trie = []
-        self.out = []
-        self.fail = []
-        self.trie.append({})  # root 0
-        self.out.append([])
-        self.fail.append(0)
-        for pat in patterns:
-            node = 0
-            for ch in pat:
-                if ch not in self.trie[node]:
-                    self.trie[node][ch] = len(self.trie)
-                    self.trie.append({})
-                    self.out.append([])
-                    self.fail.append(0)
-                node = self.trie[node][ch]
-            self.out[node].append(pat)
-        # build failure links BFS
-        q = deque()
-        for ch, nxt in self.trie[0].items():
-            self.fail[nxt] = 0
-            q.append(nxt)
-        while q:
-            r = q.popleft()
-            for ch, s in self.trie[r].items():
-                q.append(s)
-                state = self.fail[r]
-                while state and ch not in self.trie[state]:
-                    state = self.fail[state]
-                self.fail[s] = self.trie[state].get(ch, 0)
-                self.out[s].extend(self.out[self.fail[s]])
-
-    def find_all(self, text: str):
-        """Yield (index_of_end, matched_pattern) for every match found."""
-        node = 0
-        for i, ch in enumerate(text):
-            while node and ch not in self.trie[node]:
-                node = self.fail[node]
-            node = self.trie[node].get(ch, 0)
-            if self.out[node]:
-                for pat in self.out[node]:
-                    yield (i, pat)
-
-# ---------------------------
-# Utilities: n-grams, morse pattern, window checking
-# ---------------------------
-def clean_and_build_ngrams(folder: str, n_range=(1,3), top_k=5000, min_count=2, min_token_len=2):
-    """Build n-grams from all .txt files in folder. Returns (words_list, freqs, diagnostics)."""
-    print(f"[INFO] Building n-grams from: {folder}")
-    t0 = time.time()
-    raw_text = []
-    files = sorted(glob.glob(os.path.join(folder, "*.txt")))
-    if not files:
-        print("[WARN] No files found in corpus folder.")
-    for path in files:
-        print(f"  loading {os.path.basename(path)}")
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                raw_text.append(fh.read().lower())
-        except Exception as e:
-            print(f"  warning reading {path}: {e}")
-    text = " ".join(raw_text)
-    # restrict characters
-    filtered = "".join(ch if ch in ALLOWED_CHARS else " " for ch in text)
-    tokens = [t for t in filtered.split() if len(t) >= min_token_len and any(c.isalnum() for c in t)]
-    print(f"  tokens after cleaning: {len(tokens)}")
-    ngram_counts = Counter()
-    for n in range(n_range[0], n_range[1] + 1):
-        print(f"  generating {n}-grams...")
-        for i in range(len(tokens) - n + 1):
-            ngram = " ".join(tokens[i:i + n])
-            ngram_counts[ngram] += 1
-    # filter by min_count and take top_k
-    filtered_counts = {k: v for k, v in ngram_counts.items() if v >= min_count}
-    most_common = Counter(filtered_counts).most_common(top_k)
-    words = [w for w, _ in most_common]
-    freqs = dict(most_common)
-    diagnostics = {"raw_tokens": len(text.split()), "filtered_tokens": len(tokens), "unique_ngrams": len(filtered_counts)}
-    print(f"[DONE] n-grams built: {len(words)} items in {time.time()-t0:.1f}s")
-    return words, freqs, diagnostics
-
-def word_to_bordered_morse(word: str) -> str:
-    # word is expected lowercase and may contain spaces for multiword ngrams.
-    parts = []
-    for ch in word:
-        if ch == " ":
-            # when joining multi-word ngrams we will join by WORD_SEP later.
-            parts.append(WORD_SEP[:-1])  # add one '|' to mark separation; we'll join tokens at call site
-        elif ch in MORSE:
-            parts.append(MORSE[ch])
-        else:
-            # unknown char -> skip
-            pass
-    # The caller will usually build pattern per token; we provide helper below.
-    return parts  # list of morse tokens and separators fragment
-
-def morse_pattern_for_phrase(phrase: str) -> str:
-    """
-    Convert phrase (possibly multiword) to a morse class pattern string,
-    WITHOUT adding leading or trailing WORD_SEP. Caller decides whether to
-    add boundaries when scanning.
-    """
-    tokens = phrase.split()
-    parts = []
-    for token in tokens:
-        letters = [MORSE[ch] for ch in token if ch in MORSE]
-        if not letters:
-            continue
-        parts.append(LETTER_SEP.join(letters))
-    if not parts:
-        return ""
-    # join word tokens with WORD_SEP (which is '||') but do NOT append trailing WORD_SEP here
-    return WORD_SEP.join(parts)
-
-def window_candidate(window: str, morse_pat: str) -> Dict[str, str] or None:
-    """Return partial mapping dict glyph->class if window matches morse pattern, else None."""
-    if not morse_pat or len(window) != len(morse_pat):
-        return None
-    # reject repeat adjacent glyphs
-    for i in range(len(window)-1):
-        if window[i] == window[i+1]:
-            return None
-    mapping = {}
-    for g, m in zip(window, morse_pat):
-        cls = {'|':'S', '.':'D', '-':'H'}.get(m)
-        if cls is None:
-            return None
-        if g in mapping and mapping[g] != cls:
-            return None
-        mapping[g] = cls
-    return mapping
-
-def merge_mappings(m1: Dict[str,str], m2: Dict[str,str]) -> Dict[str,str] or None:
-    merged = dict(m1)
-    for k, v in m2.items():
-        if k in merged and merged[k] != v:
-            return None
-        merged[k] = v
-    return merged
-from collections import defaultdict
-
-def fast_merge_candidate_sets(candidate_sets):
-    print("[INFO] Fast merging candidates by glyph overlap...")
-    grouped = defaultdict(list)
-    for cset in candidate_sets:
-        for word, cands in cset.items():
-            for c in cands:
-                key = tuple(sorted(c['mapping'].keys()))
-                grouped[key].append(c['mapping'])
-    merged = []
-    for group_key, maps in grouped.items():
-        merged_dict = {}
-        for m in maps:
-            merged_dict.update(m)
-        merged.append({'mapping': merged_dict, 'count': len(maps)})
-    print(f"[DONE] Reduced {sum(len(v) for v in grouped.values())} → {len(merged)} mappings")
-    return merged
-
-# ---------------------------
-# Parallel chunk processing
-# ---------------------------
-def process_chunk_worker(args):
-    """Worker wrapper to be picklable for ProcessPoolExecutor."""
-    chunk, offset, words, patterns = args
-    return process_chunk(chunk, offset, words, patterns)
-
-def process_chunk(cipher_chunk: str, offset: int, words: List[str], patterns: Dict[str, str]):
-    """
-    Scan one ciphertext chunk for n-gram matches using precomputed morse patterns.
-    Returns a dict: word -> list of candidate dicts with window, mapping, start.
-    """
-    candidates = defaultdict(list)
-
-    total = len(words)
-    for idx, w in enumerate(words, start=1):
-        if idx % 1000 == 0 or idx == total:
-            print(f"    [chunk {offset}] scanning word {idx}/{total}")
-
-        pat = patterns.get(w)
-        if not pat:
-            continue
-
-        L = len(pat)
-        wc = cipher_chunk
-        for i in range(len(wc) - L + 1):
-            win = wc[i:i+L]
-            m = window_candidate(win, pat)
-            if m:
-                candidates[w].append({"window": win, "mapping": m, "start": offset + i})
-
-    # Cap per-word candidate windows to keep merging tractable
-    _MAX_PER = CONFIG.get("max_per_word_candidates", 5)
-    if isinstance(candidates, dict) and _MAX_PER:
-        for _w, _items in list(candidates.items()):
-            candidates[_w] = sorted(_items, key=lambda x: x.get("start", 0))[:_MAX_PER]
-
-    return candidates
-
-
-def parallel_scan(ciphertext: str, words: List[str], patterns: Dict[str,str], chunk_size=20000, max_workers=4):
-    """Split ciphertext into chunks and process in parallel, returning list of candidate dicts."""
-    print(f"[INFO] Parallel scan: ciphertext length {len(ciphertext)}, chunk_size {chunk_size}, workers {max_workers}")
-    args_list = []
-    for i in range(0, len(ciphertext), chunk_size):
-        args_list.append((ciphertext[i:i+chunk_size], i, words, patterns))
-    results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(process_chunk_worker, a) for a in args_list]
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-                results.append(res)
-            except Exception as e:
-                print(f"[!] worker error: {e}")
-    return results
-
-# ---------------------------
-# Merge candidate sets (aggressive merging)
-# ---------------------------
-def merge_candidate_sets(cand_sets: List[Dict[str, List[Dict]]], min_merge_gain=1):
-    print("[INFO] Merging candidate mappings...")
-    t0 = time.time()
-    partial_mappings = defaultdict(lambda: {"count": 0, "examples": []})
-    for all_candidates in cand_sets:
-        for word, cand_list in all_candidates.items():
-            for cand in cand_list:
-                sig = tuple(sorted(cand["mapping"].items()))
-                partial_mappings[sig]["count"] += 1
-                partial_mappings[sig]["examples"].append({"word": word, **cand})
-    # build initial pool
-    pool = [{"mapping": dict(sig), "count": info["count"], "examples": info["examples"]} for sig, info in partial_mappings.items()]
-    changed = True
-    iteration = 0
-    # greedy pairwise merging: merge b into a when they are consistent and increase mapping size
-    while changed and iteration < CONFIG.get('max_merge_iter', 5):
-        iteration += 1
-        print(f"  merge iteration {iteration}, pool size {len(pool)}")
-        changed = False
-        new_pool = []
-        used = set()
-        for i, a in enumerate(pool):
-            if i in used:
-                continue
-            merged_map = dict(a["mapping"])
-            total_count = a["count"]
-            examples = list(a["examples"])
-            for j in range(i+1, len(pool)):
-                if j in used:
-                    continue
-                b = pool[j]
-                m = merge_mappings(merged_map, b["mapping"])
-                if m and len(m) - len(merged_map) >= min_merge_gain:
-                    merged_map = m
-                    total_count += b["count"]
-                    examples.extend(b["examples"])
-                    used.add(j)
-                    changed = True
-            new_pool.append({"mapping": merged_map, "count": total_count, "examples": examples})
-        pool = new_pool
-    # deduplicate and keep the most complete versions
-    merged_final = {}
-    for item in pool:
-        sig = tuple(sorted(item["mapping"].items()))
-        if sig not in merged_final or len(item["mapping"]) > len(merged_final[sig]["mapping"]):
-            merged_final[sig] = item
-    max_size = max((len(v["mapping"]) for v in merged_final.values()), default=0)
-    filtered = [v for v in merged_final.values() if len(v["mapping"]) >= max_size - 1]
-    print(f"[DONE] Merging finished in {time.time()-t0:.1f}s, final candidates: {len(filtered)}")
-    return filtered
-
-# ---------------------------
-# Fast decoding + scoring using Aho-Corasick
-# ---------------------------
-def weighted_word_score(word_counts, word_freqs,
-                        min_length=3, length_exponent=5,
-                        single_letter_cap=5, single_letter_weight=0.1, alpha=0.7):
-    score = 0
-    for w, c in word_counts.items():
-        raw_len = len(w.replace(" ",""))
-        freq = word_freqs.get(w, 1)
-        if raw_len < min_length:
-            capped = min(c, single_letter_cap)
-            score += single_letter_weight * (capped**2) * (freq ** alpha)
-            continue
-        score += (c**2) * (freq ** alpha) * (raw_len ** length_exponent)
-    return score
-def morse_to_plain(decoded_morse: str) -> str:
-    """
-    Convert a decoded_morse string (symbols '.', '-', '|' with LETTER_SEP and WORD_SEP)
-    into plain text, where WORD_SEP -> a single space, and LETTER_SEP separates morse letters.
-    Preserves leading/trailing word spaces if present.
-    """
-    rev_morse = {v: k for k, v in MORSE.items()}
-    out_tokens = []
-    i = 0
-    L = len(decoded_morse)
-    # We'll treat WORD_SEP ('||') as an explicit space token
-    while i < L:
-        # if we see a WORD_SEP at this position, append a space and advance by 2
-        if i + 1 < L and decoded_morse[i:i+2] == WORD_SEP:
-            out_tokens.append(" ")   # preserve explicit space token
-            i += 2
-            continue
-        # otherwise collect up to next WORD_SEP
-        j = decoded_morse.find(WORD_SEP, i)
-        if j == -1:
-            seg = decoded_morse[i:]
-            i = L
-        else:
-            seg = decoded_morse[i:j]
-            i = j
-        # seg now contains letters separated by LETTER_SEP ('|')
-        letters = []
-        for morse_letter in seg.split(LETTER_SEP):
-            if not morse_letter:
-                continue
-            letters.append(rev_morse.get(morse_letter, "_"))
-        if letters:
-            out_tokens.append("".join(letters).lower())
-    # join tokens but avoid merging the explicit spaces with surrounding words incorrectly:
-    # tokens list may contain words and " " items; join with '' then normalize multi-space to single space
-    joined = "".join(t if t == " " else t for t in out_tokens)
-    # normalize runs of spaces to a single space, and strip only trailing spaces (but preserve a leading space if present)
-    # preserve leading space if present
-    has_lead_space = joined.startswith(" ")
-    normalized = " ".join(joined.split())
-    if has_lead_space and not normalized.startswith(" "):
-        normalized = " " + normalized
-    return normalized
-
-def decode_and_score(ciphertext: str, merged_mappings: List[Dict], words: List[str], word_freqs: Dict[str,int]):
-    print(f"[INFO] Decoding {len(merged_mappings)} candidate mappings and scoring...")
-    t0 = time.time()
-    patterns = [w.lower() for w in words]
-    automaton = AhoCorasick(patterns)
-
-    rev_morse = {v: k for k, v in MORSE.items()}
-    class_to_symbol = {"D": ".", "H": "-", "S": "|"}
-
-    results = []
-    total = len(merged_mappings)
-    for idx, m in enumerate(merged_mappings, start=1):
-        if idx % 10 == 0 or idx == total:
-            print(f"  scoring mapping {idx}/{total}")
-        mapping = m["mapping"]
-        decoded_class = "".join(mapping.get(g, "_") for g in ciphertext)
-        decoded_morse = "".join(class_to_symbol.get(c, "_") for c in decoded_class)
-        decoded_text = morse_to_plain(decoded_morse)
-
-        # --- deduplicate overlapping word matches ---
-        matches = []
-        for end_idx, pat in automaton.find_all(decoded_text):
-            start_idx = end_idx - len(pat) + 1
-            matches.append((start_idx, end_idx, pat))
-        matches.sort(key=lambda x: (x[0], -(x[1]-x[0])))
-
-        non_overlapping = []
-        last_end = -1
-        for s, e, pat in matches:
-            if s > last_end:
-                non_overlapping.append(pat)
-                last_end = e
-
-        # count only non-overlapping words
-        word_counts = Counter(non_overlapping)
-
-        score = weighted_word_score(word_counts, word_freqs)
-        results.append({
-            "mapping": mapping,
-            "decoded_text": decoded_text,
-            "word_counts": word_counts,
-            "total_hits": sum(word_counts.values()),
-            "score": score
-        })
-    results.sort(key=lambda x: x["score"], reverse=True)
-    print(f"[DONE] Decoding & scoring in {time.time()-t0:.1f}s")
-    return results
-
-
-# ---------------------------
-# CSV export
-# ---------------------------
-def export_results(rows: List[Dict], words: List[str], export_dir: str, export_k: int = 1000):
-    os.makedirs(export_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(export_dir, f"decoded_results_{timestamp}.csv")
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        fieldnames = ["rank", "total_matches", "word_hits", "glyph_mapping", "top_words", "decoded_preview"]
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for rank, r in enumerate(rows[:export_k], start=1):
-            mapping = r["mapping"]
-            decoded_text = r["decoded_text"]
-            word_counts = r["word_counts"]
-            writer.writerow({
-                "rank": rank,
-                "total_matches": r.get("total_hits", 0),
-                "word_hits": sum(word_counts.values()),
-                "glyph_mapping": "; ".join(f"{k}:{v}" for k, v in mapping.items()),
-                "top_words": ", ".join(f"{w}({c})" for w, c in word_counts.most_common(10)),
-                "decoded_preview": decoded_text
-            })
-    print(f"[INFO] Exported results to: {path}")
-    return path
-
-# ---------------------------
-# Main runner
-# ---------------------------
-def main():
-    # 1) build n-grams
-    words, word_freqs, diag = clean_and_build_ngrams(CORPUS_FOLDER, n_range=NGRAM_RANGE,
-                                                     top_k=TOP_K_NGRAMS, min_count=MIN_COUNT,
-                                                     min_token_len=MIN_TOKEN_LEN)
-    print("Corpus diagnostics:", diag)
-    print("Sample words:", words[:20])
-
-    # 2) load ciphertext
-    with open(MESSAGE_PATH, "r", encoding="utf-8") as fh:
-        ciphertext = fh.read().strip().replace("\n", "").replace(" ", "")
-    print(f"[INFO] ciphertext length = {len(ciphertext)}")
-
-    # 3) precompute morse pattern strings for each word
-    print("[INFO] Precomputing morse patterns for words...")
-    patterns = {}
-    for i, w in enumerate(words, start=1):
-        if i % 2000 == 0:
-            print(f"  patterns computed: {i}/{len(words)}")
-        core = morse_pattern_for_phrase(w)
-        if core:
-            # require a word boundary before and after when scanning windows
-            patterns[w] = WORD_SEP + core + WORD_SEP
-        else:
-            patterns[w] = ""
-
-    # 4) parallel scan in chunks
-    print("[INFO] Starting parallel chunk scan...")
-    start = time.time()
-    cand_sets = parallel_scan(ciphertext, words, patterns, chunk_size=CHUNK_SIZE, max_workers=MAX_WORKERS)
-    print(f"[DONE] Parallel scan took {time.time()-start:.1f}s; collected {len(cand_sets)} chunk results")
-
-    # 5) merge candidate sets into hypothesized mappings
-    merged = fast_merge_candidate_sets(cand_sets)
-    print(f"[INFO] merged candidate count: {len(merged)}")
-
-    # 6) decode + score using Aho-Corasick
-    ranked = decode_and_score(ciphertext, merged, words, word_freqs)
-
-    # 7) export
-    export_path = export_results(ranked, words, OUTPUT_DIR, export_k=EXPORT_K)
-
-    # 8) print top few
-    TOP_K = min(10, len(ranked))
-    for rnk in range(TOP_K):
-        r = ranked[rnk]
-        print(f"\n--- Rank {rnk+1} | score {r['score']} | hits {r['total_hits']} ---")
-        print("Top matched words:", r["word_counts"].most_common(10))
-        print("Decoded preview:", r["decoded_text"][:300])
-
-    return export_path
-
-
-# [Main block stripped to EOF]
-
-# ==== END Embedded: PolluxDecoder.py ====
-
-# ==== BEGIN Embedded: polluxcrypto.py ====
-import itertools
-import multiprocessing as mp
-from collections import Counter
-import time
-
-# --- Morse definitions ---
-MORSE_DICT = {
-    'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.',
-    'F': '..-.', 'G': '--.', 'H': '....', 'I': '..', 'J': '.---',
-    'K': '-.-', 'L': '.-..', 'M': '--', 'N': '-.', 'O': '---',
-    'P': '.--.', 'Q': '--.-', 'R': '.-.', 'S': '...', 'T': '-',
-    'U': '..-', 'V': '...-', 'W': '.--', 'X': '-..-', 'Y': '-.--',
-    'Z': '--..', ' ': '/'
-}
-
-STOPWORDS = ["THE", "AND", "OF", "TO", "IN", "IT", "IS", "BE", "AS", "AT", "BY"]
-
-def text_to_morse(text):
-    return ''.join(MORSE_DICT.get(c, '') for c in text if c in MORSE_DICT)
-
-def collapse_runs_to_morse(cipher, mapping):
-    return ''.join(mapping.get(ch, '?') for ch in cipher)
-
-def evaluate_fit(cipher, morse_target):
-    # sliding window match between cipher Morse and target Morse
-    max_score = 0
-    for i in range(len(cipher) - len(morse_target) + 1):
-        segment = cipher[i:i + len(morse_target)]
-        matches = sum(a == b for a, b in zip(segment, morse_target))
-        score = matches / len(morse_target)
-        if score > max_score:
-            max_score = score
-    return max_score
-
-def generate_candidate_mappings(symbols):
-    for dots in itertools.combinations(symbols, 3):
-        dots = set(dots)
-        for dashes in itertools.combinations([s for s in symbols if s not in dots], 3):
-            dashes = set(dashes)
-            spaces = [s for s in symbols if s not in dots | dashes]
-            yield {s: '.' for s in dots} | {s: '-' for s in dashes} | {s: '/' for s in spaces}
-
-import multiprocessing as mp
-import itertools
-import time
-
-# Global shared data for workers
-CIPHERTEXT = None
-MORSE_TARGETS = None
-
-def init_worker(ciphertext, morse_targets):
-    global CIPHERTEXT, MORSE_TARGETS
-    CIPHERTEXT = ciphertext
-    MORSE_TARGETS = morse_targets
-
-def evaluate_mapping(mapping):
-    morse_guess = ''.join(mapping.get(ch, '?') for ch in CIPHERTEXT)
-    best_local = max(
-        sum(a == b for a, b in zip(morse_guess[i:i+len(t)], t)) / len(t)
-        for t in MORSE_TARGETS
-        for i in range(len(CIPHERTEXT) - len(t) + 1)
-    )
-    return (mapping, best_local)
-
-import random
-
-def generate_candidate_mappings(symbols, limit=100_000, seed=None):
-    """Randomly sample mappings from 36 symbols → {'.', '-', 'x'}"""
-    rng = random.Random(seed)
-    morse_symbols = ['.', '-', 'x']
-    for _ in range(limit):
-        yield {s: rng.choice(morse_symbols) for s in symbols}
-
-
-def pollux_solver_parallel(ciphertext,
-                           n_processes=8,
-                           score_threshold=0.98,
-                           max_evaluations=100000,
-                           verbose=False):
-    symbols = sorted(set(ciphertext))
-    morse_targets = [
-        ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..",
-        ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.",
-        "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--.."
-    ]
-    morse_targets += [''.join(t) for t in itertools.permutations(['.', '-'], 3)]
-
-    print(f"[INFO] Cipher has {len(symbols)} symbols: {symbols}")
-    print(f"[INFO] {len(morse_targets)} morse targets generated")
-
-    best_mapping, best_score = None, -float('inf')
-    start_time = time.time()
-    counter = 0
-
-    mapping_gen = generate_candidate_mappings(symbols)
-
-    with mp.get_context("spawn").Pool(
-        processes=n_processes,
-        initializer=init_worker,
-        initargs=(ciphertext, morse_targets),
-        maxtasksperchild=50
-    ) as pool:
-        for mapping, score in pool.imap_unordered(evaluate_mapping, mapping_gen, chunksize=200):
-            counter += 1
-            if score > best_score:
-                best_mapping, best_score = mapping, score
-                if verbose:
-                    print(f"[DEBUG] New best {best_score:.4f} at eval {counter}")
-
-            if score_threshold and best_score >= score_threshold:
-                print(f"[INFO] Score threshold reached ({best_score:.4f}), stopping early.")
-                pool.terminate()
-                break
-
-            if max_evaluations and counter >= max_evaluations:
-                print(f"[INFO] Max evaluations reached ({max_evaluations}), stopping early.")
-                pool.terminate()
-                break
-
-    elapsed = time.time() - start_time
-    print(f"[INFO] Completed in {elapsed:.2f}s, evaluated {counter} mappings.")
-    print(f"[RESULT] Best score: {best_score:.4f}")
-
-    return best_mapping, best_score
-
-
-
-# [Main block stripped to EOF]
-
-# ==== END Embedded: polluxcrypto.py ====
-
-# ==== BEGIN Glue & Pipeline (no CLI) ====
-import itertools
-import time
+from __future__ import annotations
+import os, re, math, string, random, csv
+import concurrent.futures as cf
+from typing import Dict, List, Tuple, Optional
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional high-performance backends
+# =======================
+# Environment & Backends
+# =======================
+# Max out BLAS threads for NumPy (tune if you see oversubscription)
+os.environ.setdefault("OMP_NUM_THREADS", "16")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
+os.environ.setdefault("MKL_NUM_THREADS", "16")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "16")
+
+_TORCH = False
+_NUMPY = False
+_TORCH_DEVICE = "cpu"
+_TORCH_BACKEND = "none"   # "cuda", "rocm", "mps", or "none"
+
 try:
     import torch
     _TORCH = True
-    _TORCH_DEVICE = (
-        "cuda" if torch.cuda.is_available()
-        else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
-    )
+    # CUDA (NVIDIA) usually reports cuda; ROCm (AMD) often appears under cuda device with torch.version.hip present
+    if torch.cuda.is_available():
+        _TORCH_DEVICE = "cuda"
+        _TORCH_BACKEND = "cuda" if getattr(torch.version, "hip", None) is None else "rocm"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        _TORCH_DEVICE = "mps"
+        _TORCH_BACKEND = "mps"
 except Exception:
     torch = None
     _TORCH = False
-    _TORCH_DEVICE = "cpu"
 
 try:
-    import numpy as _np
-    from numpy.lib.stride_tricks import sliding_window_view as _sliding_window_view
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view as _sliding
     _NUMPY = True
 except Exception:
-    _np = None
-    _sliding_window_view = None
+    np = None
+    _sliding = None
     _NUMPY = False
 
-CLASS_TO_SYMBOL = {"D": ".", "H": "-", "S": "/"}
-CONFIG.setdefault("threads", 8)
+# =======================
+# Config (balanced ~1h target, 1200-char preview)
+# =======================
+CONFIG = {
+    # ---------- Inputs ----------
+    "ciphertext": None,                 # Paste ciphertext (string) here; if None, read from file
+    "ciphertext_file": "./cipher.txt",  # Used when ciphertext is None
+    "corpus_dir": "./corpus",           # Directory containing *.txt files
 
-def class_map_to_symbol_map(class_map):
-    return {k: CLASS_TO_SYMBOL[v] for k, v in class_map.items() if v in CLASS_TO_SYMBOL}
+    # ---------- Parallel search ----------
+    "threads": 16,                      # ThreadPool size (5800X3D -> 16 logical threads)
+    "random_starts": 56,                # Starts per class-split (breadth)
+    "hill_steps": 3000,                 # Swap attempts per start (depth)
+    "seed": 42,                         # RNG seed (or None)
 
-def constraints_from_candidates(merged_list, top=10, require_unanimous=True):
-    votes = defaultdict(lambda: Counter())
-    take = merged_list[:max(1, top)]
-    for item in take:
-        for sym, cls in item["mapping"].items():
-            votes[sym][cls] += 1
-    constraints = {}
-    for sym, cnts in votes.items():
-        best_cls, best_votes = cnts.most_common(1)[0]
-        if require_unanimous:
-            if best_votes == len(take):
-                constraints[sym] = CLASS_TO_SYMBOL.get(best_cls, None)
-        else:
-            constraints[sym] = CLASS_TO_SYMBOL.get(best_cls, None)
-    return {k:v for k,v in constraints.items() if v is not None}
+    # ---------- Class-count splits (dots, dashes) ----------
+    # The remaining symbols become '/'. Keep richer splits to avoid slash soup.
+    "class_splits": [(6,6), (7,7), (5,6), (6,5), (4,4)],
 
-def decoder_build_patterns(words):
-    pat = {}
-    for w in words:
-        p = morse_pattern_for_phrase(w)
-        if p:
-            pat[w] = p
-    return pat
+    # ---------- Language model weights ----------
+    "lm_word_weight": 1.0,              # Word-frequency log likelihood
+    "lm_char_weight": 1.0,              # Char-bigram log likelihood
+    "word_min_len": 2,                  # Ignore short words (except 'a', 'i')
 
-def convert_morse_classes_to_optimizer(morse_str):
-    # decoder uses '|' for letter sep and '||' for word sep; optimizer uses '/' for any sep
-    return morse_str.replace('||', '//').replace('|', '/')
+    # ---------- Morse n-gram targets ----------
+    "targets_top_words": 2500,          # Top-N corpus words to convert to Morse targets
+    "targets_min_len": 1,               # Minimum Morse length of target
+    "targets_max_len": 8,               # Max Morse length (keeps sliding windows tractable)
+    "ngram_weight_alpha": 1.4,          # Weight(L) = L ** alpha (favor longer n-grams)
+    "ngram_weight_norm": True,          # Normalize weights across lengths
 
-# ---- High-performance scorer preparation ----
-_SYMBOL_TO_INT = {'.': 1, '-': 2, '/': 0}  # 3-class encoding
+    # ---------- Early stop ----------
+    "early_stop_score": None,           # Use None to disable absolute threshold; rely on search depth
 
-def _encode_morse_str_to_ints(s: str):
-    return [_SYMBOL_TO_INT.get(ch, 0) for ch in s]
+    # ---------- Priors to avoid separator soup ----------
+    "sep_target_ratio": 0.30,           # target fraction of '/' in morse (~0.25–0.35 reasonable)
+    "sep_penalty_strength": 150.0,      # penalty weight for exceeding sep target
+    "dot_ratio_target": 0.60,           # target fraction of dots among signals (dots+dashes)
+    "dot_ratio_strength": 50.0,         # penalty weight for dot:dash deviation
+    "sep_run_penalty_strength": 3.0,    # per extra '/' in a run (discourage //// sequences)
 
-def _prep_targets_torch(morse_targets):
-    groups = defaultdict(list)
-    for t in morse_targets:
-        ints = _encode_morse_str_to_ints(t)
-        if ints:
-            groups[len(ints)].append(ints)
-    stacked = {}
-    for L, seqs in groups.items():
-        T = torch.tensor(seqs, dtype=torch.int16, device=_TORCH_DEVICE)
-        stacked[L] = T
-    return stacked
+    # ---------- Consensus refinement ----------
+    "topK_global": 40,                  # Best K from parallel phase
+    "consensus_rounds": 3,              # Iterative refinement passes
+    "consensus_top_from_each_round": 40,# Keep this many after each round
+    "parent_pool": 16,                  # Parents considered for crossover
+    "children_per_pair": 2,             # Children spawned per parent pair
+    "neighbors_per_map": 900,           # Local neighbor proposals per mapping per round
+    "repair_max_swaps": 150,            # Max swaps during class-count repair
+    "consensus_symbol_min_vote": 0.0,   # Minimal vote to accept a symbol class
 
-def _prep_targets_numpy(morse_targets):
-    groups = defaultdict(list)
-    for t in morse_targets:
-        ints = _encode_morse_str_to_ints(t)
-        if ints:
-            groups[len(ints)].append(ints)
-    stacked = {}
-    for L, seqs in groups.items():
-        stacked[L] = _np.asarray(seqs, dtype=_np.int16)
-    return stacked
+    # ---------- Preview (hotspot-centered) ----------
+    "preview_chars": 1200,              # Length of final plaintext preview (expanded)
+    "preview_window_morse": 2000,       # Morse window around hotspot to convert for preview (wider)
 
-# Globals used by evaluators
-CIPHERTEXT = None
-MORSE_TARGETS = None
-_TARGETS_TORCH = None
-_TARGETS_NUMPY = None
+    # ---------- Logging ----------
+    "log_every": 250,                   # Print progress from starts at most this often (currently quiet)
 
-def prepare_targets(morse_targets):
-    global MORSE_TARGETS, _TARGETS_TORCH, _TARGETS_NUMPY
-    MORSE_TARGETS = morse_targets
-    _TARGETS_TORCH = _prep_targets_torch(morse_targets) if _TORCH else None
-    _TARGETS_NUMPY = _prep_targets_numpy(morse_targets) if _NUMPY else None
+    # ---------- CSV export ----------
+    "export_csv": True,                 # turn CSV export on/off
+    "export_top_k": 50,                 # how many candidates to write
+    "export_path_initial": "candidates_initial.csv",
+    "export_path_refined": "candidates_refined.csv",
+    "export_preview_chars": 240,        # per-row preview chars (hotspot-centered)
+    "export_preview_window_morse": 800, # narrower window for CSV previews
+}
 
-def _mapping_to_morse_int_array(mapping, ciphertext):
-    return _np.fromiter((
-        {'.':1,'-':2,'/':0}.get(mapping.get(ch, '/'), 0) for ch in ciphertext
-    ), dtype=_np.int16, count=len(ciphertext)) if _NUMPY else None
+CONFIG.update({
+    # Richer class splits (exact counts): ~14/14 signals leaves ~8 seps (≈22%)
+    "class_splits": [(14,14), (13,13), (15,14), (14,15), (12,12), (15,15)],
 
-def _score_torch(morse_guess_np):
-    g = torch.from_numpy(morse_guess_np).to(_TORCH_DEVICE)
-    best = torch.tensor(0.0, device=_TORCH_DEVICE)
-    N = g.shape[0]
-    for L, T in _TARGETS_TORCH.items():
-        if L > N:
-            continue
-        W = g.unfold(0, L, 1)            # [S, L]
-        eq = (W.unsqueeze(1) == T.unsqueeze(0))  # [S, K, L]
-        matches = eq.sum(dim=-1)         # [S, K]
-        local_best = matches.max().to(torch.float32) / float(L)
-        best = torch.maximum(best, local_best)
-    return float(best.item())
+    # Strengthen Morse n-gram signal
+    "targets_top_words": 3000,
+    "targets_max_len": 10,
+    "ngram_weight_alpha": 1.5,
 
-def _score_numpy(morse_guess_np):
-    N = morse_guess_np.shape[0]
-    best = 0.0
-    for L, T in _TARGETS_NUMPY.items():
-        if L > N:
-            continue
-        W = _sliding_window_view(morse_guess_np, window_shape=L)  # [S, L]
-        eq = (W[:, None, :] == T[None, :, :])                     # [S, K, L]
-        matches = eq.sum(axis=2)                                  # [S, K]
-        local_best = matches.max() / float(L)
-        if local_best > best:
-            best = float(local_best)
-    return best
+    # Make separator ratio penalty symmetric (we’ll enable it below)
+    "sep_target_ratio": 0.24,            # aim ~24% '/' overall
+    "sep_penalty_strength": 380.0,       # stronger penalty
+    # Dot:dash realism (dots slightly more common)
+    "dot_ratio_target": 0.60,
+    "dot_ratio_strength": 80.0,
+    # Run-length penalty for '/////'
+    "sep_run_penalty_strength": 5.0,
 
-def evaluate_mapping(mapping):
-    """GPU/NumPy-accelerated evaluator with thread-safe globals preparation."""
-    if _NUMPY:
-        morse_guess_np = _mapping_to_morse_int_array(mapping, CIPHERTEXT)
-    else:
-        morse_guess_np = None
-    if _TORCH and _TARGETS_TORCH is not None and morse_guess_np is not None:
-        return (mapping, _score_torch(morse_guess_np))
-    elif _NUMPY and _TARGETS_NUMPY is not None and morse_guess_np is not None and _sliding_window_view is not None:
-        return (mapping, _score_numpy(morse_guess_np))
-    else:
-        # Fallback simple scorer
-        morse_guess = ''.join(mapping.get(ch, '/') for ch in CIPHERTEXT)
-        best_local = 0.0
-        for t in MORSE_TARGETS:
-            L = len(t)
-            for i in range(len(CIPHERTEXT) - L + 1):
-                segment = morse_guess[i:i+L]
-                matches = sum(a == b for a, b in zip(segment, t))
-                score = matches / L
-                if score > best_local:
-                    best_local = score
-        return (mapping, best_local)
+    # NEW: reward valid Morse letters (pulls toward real decodes)
+    "valid_letter_reward": 600.0,        # scale ~200–600
+})
 
-def generate_candidate_mappings_constrained(symbols, constraints, dots_total=3, dashes_total=3):
-    sym_set = list(symbols)
-    pre_dots  = {s for s, v in constraints.items() if v == '.'}
-    pre_dash  = {s for s, v in constraints.items() if v == '-'}
-    pre_space = {s for s, v in constraints.items() if v == '/'}
 
-    if len(pre_dots) > dots_total or len(pre_dash) > dashes_total:
-        return
-        yield
+ALNUM = set(string.ascii_lowercase + string.digits)
 
-    rem_dots = dots_total - len(pre_dots)
-    rem_dash = dashes_total - len(pre_dash)
+# =======================
+# Morse tables
+# =======================
+MORSE_TABLE = {
+    'a': '.-',   'b': '-...', 'c': '-.-.', 'd': '-..',  'e': '.',
+    'f': '..-.', 'g': '--.',  'h': '....', 'i': '..',   'j': '.---',
+    'k': '-.-',  'l': '.-..', 'm': '--',   'n': '-.',   'o': '---',
+    'p': '.--.', 'q': '--.-', 'r': '.-.',  's': '...',  't': '-',
+    'u': '..-',  'v': '...-', 'w': '.--',  'x': '-..-', 'y': '-.--',
+    'z': '--..',
+    '0': '-----','1': '.----','2': '..---','3': '...--','4': '....-',
+    '5': '.....','6': '-....','7': '--...','8': '---..','9': '----.',
+}
+MORSE_TO_CHAR = {v: k for k, v in {k.upper(): v for k, v in MORSE_TABLE.items()}.items()}
 
-    undecided = [s for s in sym_set if s not in constraints]
-    for dots_choice in itertools.combinations(undecided, rem_dots):
-        rem_after_dots = [s for s in undecided if s not in dots_choice]
-        for dash_choice in itertools.combinations(rem_after_dots, rem_dash):
-            mapping = {}
-            for s in pre_dots:  mapping[s] = '.'
-            for s in pre_dash:  mapping[s] = '-'
-            for s in pre_space: mapping[s] = '/'
-            for s in dots_choice: mapping[s] = '.'
-            for s in dash_choice: mapping[s] = '-'
-            for s in rem_after_dots:
-                if s not in dash_choice:
-                    mapping[s] = '/'
-            yield mapping
+# =======================
+# Corpus model
+# =======================
+def clean_text(txt: str) -> str:
+    txt = txt.lower()
+    txt = re.sub(r'[^a-z0-9\s]+', ' ', txt)
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    return txt
 
-def optimize_with_constraints(ciphertext, morse_targets, constraints, n_processes=8, max_evaluations=200000, threshold=0.99, verbose=True):
-    """Multithreaded optimizer with GPU/NumPy-accelerated scoring."""
-    symbols = sorted(set(ciphertext))
-    global CIPHERTEXT
-    CIPHERTEXT = ciphertext
-    prepare_targets(morse_targets)
-
-    best_mapping, best_score = None, -1.0
-    counter = 0
-    start = time.time()
-
-    threads = max(1, int(CONFIG.get("threads", n_processes)))
-    inflight_target = threads * 6
-
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = []
-        gen = generate_candidate_mappings_constrained(symbols, constraints)
-        exhausted = False
-
-        while True:
-            while not exhausted and len(futures) < inflight_target and (not max_evaluations or counter < max_evaluations):
+def load_corpus_texts(corpus_dir: str) -> List[str]:
+    out = []
+    for root, _, files in os.walk(corpus_dir):
+        for f in files:
+            if f.lower().endswith(".txt"):
                 try:
-                    mapping = next(gen)
-                except StopIteration:
-                    exhausted = True
-                    break
-                counter += 1
-                futures.append(ex.submit(evaluate_mapping, mapping))
+                    with open(os.path.join(root, f), "r", encoding="utf-8", errors="ignore") as fh:
+                        out.append(fh.read())
+                except Exception:
+                    pass
+    return out
 
-            if not futures:
-                break
+def build_word_freq_and_char_bigrams(corpus_dir: str) -> Tuple[Counter, Counter]:
+    texts = load_corpus_texts(corpus_dir)
+    cleaned = clean_text(" ".join(texts))
+    words = cleaned.split()
+    word_freq = Counter(words)
+    chars = " " + cleaned + " "
+    bigrams = Counter(zip(chars, chars[1:]))
+    return word_freq, bigrams
 
-            take = min(len(futures), threads)
-            for fut in as_completed(futures[:take]):
-                futures.remove(fut)
-                mapping, score = fut.result()
-                if score > best_score:
-                    best_mapping, best_score = mapping, score
-            if verbose:
-                print(f"[opt] total {counter}, best={best_score:.4f} [{_TORCH_DEVICE if _TORCH else ('numpy' if _NUMPY else 'python')}]")
+def log_prob_words(text: str, word_freq: Counter, word_min_len=2) -> float:
+    words = clean_text(text).split()
+    total = sum(word_freq.values()) + len(word_freq)
+    lp = 0.0
+    for w in words:
+        if w in ("a", "i") or len(w) >= word_min_len:
+            lp += math.log((word_freq[w] + 1) / total)
+    return lp
 
-            if threshold and best_score >= threshold:
-                if verbose:
-                    print(f"[opt] Threshold {threshold:.3f} reached at {counter} evals.")
-                for f in futures: f.cancel()
-                futures.clear()
-                break
+def log_prob_char_bigrams(text: str, bigr: Counter) -> float:
+    t = " " + clean_text(text) + " "
+    total = sum(bigr.values())
+    V = max(1, len({a for a, _ in bigr.keys()} | {b for _, b in bigr.keys()}))
+    denom = total + V * V
+    lp = 0.0
+    for ab in zip(t, t[1:]):
+        lp += math.log((bigr.get(ab, 0) + 1) / denom)
+    return lp
 
-            if exhausted and not futures:
-                break
+# =======================
+# Morse targets (weighted)
+# =======================
+def word_to_morse(word: str) -> str:
+    return '/'.join(MORSE_TABLE.get(ch, '') for ch in word if ch in MORSE_TABLE)
 
-    if verbose:
-        print(f"[opt] Done in {time.time()-start:.2f}s, evaluations={counter}, best={best_score:.4f}")
-    return best_mapping, best_score
+def build_morse_targets(word_freq: Counter, top_n=2500, min_len=1, max_len=8) -> List[str]:
+    words = [w for w, _ in word_freq.most_common(top_n)]
+    seqs = []
+    for w in words:
+        m = word_to_morse(w)
+        if not m:
+            continue
+        L = len(m)
+        if min_len <= L <= max_len:
+            seqs.append(m)
+    letters = list({v for v in MORSE_TABLE.values()})
+    seqs.extend(letters)
+    return seqs
 
-def parallel_scan_threaded(ciphertext, words, patterns, chunk_size=20000, max_workers=4):
-    """Threaded version of decoder.parallel_scan to avoid multiprocessing on macOS."""
-    args_list = []
-    for i in range(0, len(ciphertext), chunk_size):
-        args_list.append((ciphertext[i:i+chunk_size], i, words, patterns))
+class MorseTargets:
+    """Pre-encoded Morse targets grouped by length, with length weights."""
+    def __init__(self, targets: List[str], alpha: float = 1.4, normalize: bool = True):
+        self.alpha = alpha
+        self.normalize = normalize
+        self.by_len = defaultdict(list)
+        for t in targets:
+            self.by_len[len(t)].append(t)
 
+        self.enc = {'.': 1, '-': 2, '/': 0}
+        self.weights = {}
+        self.torch_by_len = {}
+        self.numpy_by_len = {}
+
+        for L, seqs in self.by_len.items():
+            self.weights[L] = float(L ** self.alpha)
+            if _TORCH:
+                T = torch.tensor([[self.enc.get(ch, 0) for ch in s] for s in seqs],
+                                 dtype=torch.int16, device=_TORCH_DEVICE)
+                self.torch_by_len[L] = T
+            if _NUMPY:
+                A = np.asarray([[self.enc.get(ch, 0) for ch in s] for s in seqs], dtype=np.int16)
+                self.numpy_by_len[L] = A
+
+        if self.normalize and self.weights:
+            total = sum(self.weights.values())
+            for L in self.weights:
+                self.weights[L] /= total
+
+# =======================
+# Morse parsing & hotspot preview
+# =======================
+def morse_to_plaintext(morse: str) -> str:
+    if not morse:
+        return ""
+    # Normalize separators: 3+ '/' => word break; 1–2 '/' => letter break
+    morse = re.sub(r'/+', lambda m: ' /// ' if len(m.group(0)) >= 3 else ' / ', morse)
+    out_words = []
+    for tk in morse.strip().split(' /// '):
+        letters = []
+        for chunk in tk.strip().split(' / '):
+            if not chunk:
+                continue
+            letters.append(MORSE_TO_CHAR.get(chunk.replace(' ', ''), '?'))
+        out_words.append("".join(letters))
+    return " ".join(out_words)
+
+def apply_mapping(cipher: str, mapping: Dict[str, str]) -> str:
+    # unknowns -> '/' (separator), conservative to avoid false dots/dashes
+    return "".join(mapping.get(ch, '/') for ch in cipher)
+
+def morse_string_to_ints(m: str) -> "np.ndarray":
+    enc = {'.':1,'-':2,'/':0}
+    return np.fromiter((enc.get(ch, 0) for ch in m), dtype=np.int16, count=len(m))
+
+def hotspot_index_from_targets(morse: str, tgt: MorseTargets) -> int:
+    """
+    Build a per-position heat (weighted best-match across lengths) and return
+    the index with maximum heat. Uses GPU/NumPy if available.
+    """
+    if not _NUMPY:
+        return max(0, len(morse)//2)
+
+    m_int = morse_string_to_ints(morse)
+    heat = np.zeros(max(1, len(m_int)), dtype=np.float32)
+
+    if _TORCH and tgt.torch_by_len:
+        g = torch.from_numpy(m_int).to(_TORCH_DEVICE)
+        for L, T in tgt.torch_by_len.items():
+            if L > g.numel():
+                continue
+            W = g.unfold(0, L, 1)                        # [S, L]
+            eq = (W.unsqueeze(1) == T.unsqueeze(0))      # [S, K, L]
+            frac = eq.sum(dim=-1).float() / float(L)     # [S, K]
+            best = frac.max(dim=1).values                # [S]
+            add = (best * tgt.weights[L]) / float(L)
+            add_cpu = add.detach().cpu().numpy()
+            inc = np.zeros(len(heat)+1, dtype=np.float32)
+            inc[:len(add_cpu)] += add_cpu
+            inc[L:] -= add_cpu
+            heat += np.cumsum(inc[:-1])
+    else:
+        for L, A in tgt.numpy_by_len.items():
+            if L > m_int.shape[0]:
+                continue
+            W = _sliding(m_int, window_shape=L)          # [S, L]
+            eq = (W[:, None, :] == A[None, :, :])        # [S, K, L]
+            frac = eq.sum(axis=2) / float(L)             # [S, K]
+            best = frac.max(axis=1)                      # [S]
+            add = (best * tgt.weights[L]) / float(L)     # [S]
+            inc = np.zeros(len(heat)+1, dtype=np.float32)
+            inc[:len(add)] += add.astype(np.float32)
+            inc[L:] -= add.astype(np.float32)
+            heat += np.cumsum(inc[:-1])
+
+    return int(np.argmax(heat))
+
+def preview_centered_on_hotspot(cipher: str, mapping: Dict[str,str], tgt: MorseTargets,
+                                window_morse: int, preview_chars: int) -> Tuple[str, str, int]:
+    """
+    Make a preview centered on the hotspot (max weighted n-gram density).
+    Returns (plaintext_preview, morse_slice, hotspot_index).
+    """
+    morse = apply_mapping(cipher, mapping)
+    if len(morse) == 0:
+        return "", "", 0
+    hotspot = hotspot_index_from_targets(morse, tgt)
+
+    half = max(10, window_morse // 2)
+    lo = max(0, hotspot - half)
+    hi = min(len(morse), hotspot + half)
+    morse_slice = morse[lo:hi]
+    plain_slice = morse_to_plaintext(morse_slice)
+    return plain_slice[:preview_chars], morse_slice, hotspot
+
+# =======================
+# Scoring (with anti-slash priors)
+# =======================
+def score_morse_gpu(morse_int: "np.ndarray", tgt: MorseTargets) -> float:
+    g = torch.from_numpy(morse_int).to(_TORCH_DEVICE)
+    accum = torch.tensor(0.0, device=_TORCH_DEVICE)
+    for L, T in tgt.torch_by_len.items():
+        if L > g.numel():
+            continue
+        W = g.unfold(0, L, 1)                   # [S, L]
+        eq = (W.unsqueeze(1) == T.unsqueeze(0)) # [S, K, L]
+        frac = eq.sum(dim=-1).float() / float(L)# [S, K]
+        local = frac.max() * tgt.weights[L]     # scalar
+        accum += local
+    return float(accum.item())
+
+def score_morse_numpy(morse_int: "np.ndarray", tgt: MorseTargets) -> float:
+    accum = 0.0
+    for L, A in tgt.numpy_by_len.items():
+        if L > morse_int.shape[0]:
+            continue
+        W = _sliding(morse_int, window_shape=L)      # [S, L]
+        eq = (W[:, None, :] == A[None, :, :])        # [S, K, L]
+        frac = eq.sum(axis=2) / float(L)             # [S, K]
+        local = float(frac.max()) * tgt.weights[L]
+        accum += local
+    return accum
+
+def score_mapping(cipher: str,
+                  mapping: Dict[str, str],
+                  word_freq: Counter, bigr: Counter,
+                  lm_word_w: float, lm_char_w: float,
+                  word_min_len: int,
+                  tgt: MorseTargets) -> Tuple[float, str, str]:
+    morse = apply_mapping(cipher, mapping)
+    plain = morse_to_plaintext(morse)
+    score = 0.0
+
+    # Language model components
+    if lm_word_w:
+        score += lm_word_w * log_prob_words(plain, word_freq, word_min_len)
+    if lm_char_w:
+        score += lm_char_w * log_prob_char_bigrams(plain, bigr)
+
+    # Weighted Morse n-gram component (GPU/NumPy preferred)
+    if _NUMPY:
+        m_int = morse_string_to_ints(morse)
+        if _TORCH and tgt.torch_by_len:
+            score += score_morse_gpu(m_int, tgt)
+        else:
+            score += score_morse_numpy(m_int, tgt)
+    else:
+        # slow fallback (pure Python)
+        enc = {'.':1,'-':2,'/':0}
+        m_int = [enc.get(ch, 0) for ch in morse]
+        accum = 0.0
+        for L, seqs in tgt.by_len.items():
+            if L > len(m_int):
+                continue
+            best_local = 0.0
+            for s in seqs:
+                t = [enc.get(ch, 0) for ch in s]
+                for i in range(0, len(m_int)-L+1):
+                    frac = sum(1 for a, b in zip(m_int[i:i+L], t) if a == b) / float(L)
+                    if frac > best_local:
+                        best_local = frac
+            accum += best_local * tgt.weights[L]
+        score += accum
+
+    # -------- Priors / constraints --------
+    if morse:
+        sep = morse.count('/')
+        dot = morse.count('.')
+        dash = morse.count('-')
+        total = max(1, sep + dot + dash)
+
+        # Symmetric separator ratio penalty (too many or too few '/')
+        sep_ratio = sep / total
+        target_sep = CONFIG.get("sep_target_ratio", 0.24)
+        sep_strength = CONFIG.get("sep_penalty_strength", 380.0)  # matches your CONFIG
+        score -= sep_strength * (sep_ratio - target_sep) ** 2
+
+        # Dot:Dash ratio penalty among signals
+        sig = dot + dash
+        if sig > 0:
+            dot_ratio = dot / sig
+            dot_target = CONFIG.get("dot_ratio_target", 0.60)
+            dot_strength = CONFIG.get("dot_ratio_strength", 80.0)
+            score -= dot_strength * (dot_ratio - dot_target) ** 2
+
+        # Run-length penalty for long separator streaks
+        run_strength = CONFIG.get("sep_run_penalty_strength", 5.0)
+        if run_strength > 0.0:
+            extra = 0
+            curr = 0
+            for ch in morse:
+                if ch == '/':
+                    curr += 1
+                    if curr > 1:
+                        extra += 1
+                else:
+                    curr = 0
+            score -= run_strength * extra
+
+        # Reward for valid Morse letters (non-empty chunks that decode cleanly)
+        valid_reward = CONFIG.get("valid_letter_reward", 600.0)
+        if valid_reward > 0.0:
+            chunks = [c for c in morse.split('/') if c]  # non-empty runs of . and -
+            if chunks:
+                valid = sum(1 for c in chunks if c in MORSE_TO_CHAR)
+                frac = valid / len(chunks)
+                score += valid_reward * (frac ** 2)
+
+    return score, plain, morse
+
+# =======================
+# Search primitives (random starts + hill climb + parallel executor)
+# =======================
+def random_mapping(symbols: List[str], n_dot: int, n_dash: int) -> Dict[str, str]:
+    """Generate a random mapping of symbols to dot/dash/sep classes."""
+    s = symbols[:]
+    random.shuffle(s)
+    return {c: ('.' if i < n_dot else '-' if i < n_dot + n_dash else '/') for i, c in enumerate(s)}
+
+def neighbors_swaps(mapping: Dict[str, str], symbols: List[str], k: int = 1) -> List[Dict[str, str]]:
+    """Generate k neighboring mappings by swapping assignments of random symbols."""
+    out = []
+    for _ in range(k):
+        a, b = random.sample(symbols, 2)
+        if mapping[a] == mapping[b]:
+            continue
+        nm = dict(mapping)
+        nm[a], nm[b] = nm[b], nm[a]
+        out.append(nm)
+    return out
+
+def run_start(cipher: str, symbols: List[str], split: Tuple[int, int],
+              word_freq: Counter, bigr: Counter, cfg: dict, tgt: MorseTargets):
+    """Perform a single hill-climb search from a random mapping for a given (dots, dashes) split."""
+    n_dot, n_dash = split
+    mapping = random_mapping(symbols, n_dot, n_dash)
+    best_score, best_plain, best_morse = score_mapping(
+        cipher, mapping, word_freq, bigr,
+        cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
+    )
+    best_map = mapping
+    for step in range(cfg["hill_steps"]):
+        for cand in neighbors_swaps(best_map, symbols, k=1):
+            s, p, m = score_mapping(
+                cipher, cand, word_freq, bigr,
+                cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
+            )
+            if s > best_score:
+                best_map, best_score, best_plain, best_morse = cand, s, p, m
+                if cfg["early_stop_score"] is not None and s >= cfg["early_stop_score"]:
+                    return (best_score, best_map, best_plain, best_morse)
+    return (best_score, best_map, best_plain, best_morse)
+
+def pollux_search_all(cipher: str, symbols: List[str],
+                      word_freq: Counter, bigr: Counter,
+                      cfg: dict, tgt: MorseTargets):
+    """Run multiple random-start hill climbs in parallel across class splits."""
     results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(process_chunk, chunk, offset, words, patterns) for (chunk, offset, _, _) in args_list]
-        for fut in as_completed(futs):
+    with cf.ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
+        futs = []
+        for split in cfg["class_splits"]:
+            if sum(split) > len(symbols):
+                continue
+            for _ in range(cfg["random_starts"]):
+                futs.append(ex.submit(run_start, cipher, symbols, split, word_freq, bigr, cfg, tgt))
+        for fut in cf.as_completed(futs):
             try:
-                res = fut.result()
-                # Apply per-word cap (defensive)
-                _MAX_PER = CONFIG.get("max_per_word_candidates", 5)
-                if _MAX_PER:
-                    for _word, _items in list(res.items()):
-                        res[_word] = sorted(_items, key=lambda x: x.get("start", 0))[:_MAX_PER]
-                results.append(res)
+                results.append(fut.result())
             except Exception as e:
-                print(f"[!] thread worker error: {e}")
-    return results
+                print("[warn] worker failed:", e)
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results  # list of (score, mapping, plaintext, morse)
 
-def decode_with_mapping(ciphertext, mapping):
-    inv = {'.': '.', '-': '-', '/': '|'}
-    morse_seq = ''.join(inv.get(mapping.get(ch, '/'), '|') for ch in ciphertext)
-    return morse_to_plain(morse_seq), morse_seq
+# =======================
+# Consensus + crossover + repair (fixed unpacking)
+# =======================
+def mapping_class_counts(mapping: Dict[str, str]) -> Tuple[int,int,int]:
+    c = Counter(mapping.values())
+    return c.get('.', 0), c.get('-', 0), c.get('/', 0)
 
+def consensus_mapping(symbols: List[str], candidates: List[Tuple[float, Dict[str,str]]],
+                      target_counts: Tuple[int,int,int], min_vote=0.0) -> Dict[str,str]:
+    wsum = sum(max(0.0, s) for s, _ in candidates) + 1e-9
+    votes = {sym: {'.':0.0, '-':0.0, '/':0.0} for sym in symbols}
+    for score, m in candidates:
+        w = max(0.0, score) / wsum
+        for sym in symbols:
+            votes[sym][m.get(sym, '/')] += w
+
+    choice = {}
+    for sym in symbols:
+        cls, v = max(votes[sym].items(), key=lambda kv: kv[1])
+        choice[sym] = cls if v >= min_vote else '/'
+
+    # greedy repair to exact class counts
+    need_dot, need_dash, need_sep = target_counts
+    have_dot, have_dash, have_sep = mapping_class_counts(choice)
+
+    def adjust(src_cls, dst_cls, needed):
+        nonlocal choice
+        if needed <= 0:
+            return
+        pool = [sym for sym, c in choice.items() if c == src_cls]
+        pool.sort(key=lambda s: (votes[s][src_cls] - votes[s][dst_cls]))  # smallest loss first
+        i = 0
+        while needed > 0 and i < len(pool):
+            s = pool[i]; i += 1
+            choice[s] = dst_cls
+            needed -= 1
+
+    if have_dot < need_dot:
+        adjust('/', '.', need_dot - have_dot)
+    if have_dash < need_dash:
+        adjust('/', '-', need_dash - have_dash)
+    have_dot, have_dash, have_sep = mapping_class_counts(choice)
+    if have_dot > need_dot:
+        adjust('.', '/', have_dot - need_dot)
+    if have_dash > need_dash:
+        adjust('-', '/', have_dash - need_dash)
+
+    return choice
+
+def crossover_child(parentA: Dict[str,str], parentB: Dict[str,str],
+                    symbols: List[str], votes=None) -> Dict[str,str]:
+    child = {}
+    for s in symbols:
+        a = parentA.get(s, '/'); b = parentB.get(s, '/')
+        if a == b:
+            child[s] = a
+        else:
+            if votes:
+                va = votes[s].get(a, 0.0); vb = votes[s].get(b, 0.0)
+                child[s] = a if va >= vb else b
+            else:
+                child[s] = a if random.random() < 0.5 else b
+    return child
+
+def repair_class_counts(mapping: Dict[str,str], target_counts: Tuple[int,int,int],
+                        symbols: List[str], max_swaps=150) -> Dict[str,str]:
+    """
+    Repair to exact dot/dash/sep counts by reassigning symbols.
+    Preference order: fill from '/' pool first to dots/dashes, then trim excess.
+    """
+    m = dict(mapping)
+    need_dot, need_dash, need_sep = target_counts
+    have_dot, have_dash, have_sep = mapping_class_counts(m)
+
+    def pool(cls): return [s for s, c in m.items() if c == cls]
+
+    swaps = 0
+    # Fill deficits from '/' pool first
+    if have_dot < need_dot and swaps < max_swaps:
+        from_sep = pool('/')
+        take = min(len(from_sep), need_dot - have_dot, max_swaps - swaps)
+        for s in from_sep[:take]: m[s] = '.'; swaps += 1
+    if have_dash < need_dash and swaps < max_swaps:
+        from_sep = pool('/')
+        take = min(len(from_sep), need_dash - have_dash, max_swaps - swaps)
+        for s in from_sep[:take]: m[s] = '-'; swaps += 1
+
+    # Recompute and trim excess by pushing to '/'
+    have_dot, have_dash, have_sep = mapping_class_counts(m)
+    if have_dot > need_dot and swaps < max_swaps:
+        from_dot = pool('.')
+        take = min(have_dot - need_dot, max_swaps - swaps)
+        for s in from_dot[:take]: m[s] = '/'; swaps += 1
+    if have_dash > need_dash and swaps < max_swaps:
+        from_dash = pool('-')
+        take = min(have_dash - need_dash, max_swaps - swaps)
+        for s in from_dash[:take]: m[s] = '/'; swaps += 1
+
+    # Final assert: exact counts if possible
+    # (If max_swaps too small, we might still be off by 1; bump max_swaps if you ever see that.)
+    return m
+
+
+def refine_consensus(cipher: str, symbols: List[str], splits: List[Tuple[int,int]],
+                     word_freq: Counter, bigr: Counter, cfg: dict, tgt: MorseTargets,
+                     initial_results: List[Tuple[float, Dict[str,str], str, str]]):
+    """
+    Iterative refinement:
+      - take topK mappings
+      - build consensus for nearby class-count splits
+      - spawn crossover children + repair
+      - hill-climb neighbors
+      - re-rank, dedupe, and repeat
+    """
+    pool: List[Tuple[float, Dict[str,str], str, str]] = initial_results[:cfg["topK_global"]]
+    symbols_sorted = sorted(symbols)
+
+    def dedupe_keep_best(items: List[Tuple[float, Dict[str,str], str, str]],
+                         cap: int) -> List[Tuple[float, Dict[str,str], str, str]]:
+        seen = {}
+        for s, m, p, morse in items:
+            key = tuple(sorted(m.items()))
+            if key not in seen or s > seen[key][0]:
+                seen[key] = (s, m, p, morse)
+        return sorted(seen.values(), key=lambda x: x[0], reverse=True)[:cap]
+
+    best = max(pool, key=lambda x: x[0])
+
+    for _round in range(cfg["consensus_rounds"]):
+        new_candidates: List[Tuple[float, Dict[str,str], str, str]] = []
+
+        for (nd, nh) in splits:
+            # Pick parents whose dot/dash counts roughly match this split
+            filtered_pairs: List[Tuple[float, Dict[str,str]]] = []
+            for s, m, p, morse in pool:
+                d, h, q = mapping_class_counts(m)
+                if abs(d - nd) <= 2 and abs(h - nh) <= 2:
+                    filtered_pairs.append((s, m))
+            if not filtered_pairs:
+                continue
+
+            target_counts = (nd, nh, max(0, len(symbols_sorted) - nd - nh))
+
+            # ----- Consensus (weighted vote) -----
+            consensus_map = consensus_mapping(symbols_sorted, filtered_pairs, target_counts,
+                                              min_vote=cfg["consensus_symbol_min_vote"])
+            consensus_map = repair_class_counts(consensus_map, target_counts, symbols_sorted,
+                                                cfg["repair_max_swaps"])
+            s0, p0, morse0 = score_mapping(cipher, consensus_map, word_freq, bigr,
+                                           cfg["lm_word_weight"], cfg["lm_char_weight"],
+                                           cfg["word_min_len"], tgt)
+            new_candidates.append((s0, consensus_map, p0, morse0))
+
+            # ----- Votes to guide crossover -----
+            wsum = sum(max(0.0, sc) for sc, _m in filtered_pairs) + 1e-9
+            votes = {sym: {'.': 0.0, '-': 0.0, '/': 0.0} for sym in symbols_sorted}
+            for sc, mp in filtered_pairs:
+                w = max(0.0, sc) / wsum
+                for sym in symbols_sorted:
+                    votes[sym][mp.get(sym, '/')] += w
+
+            # ----- Parent pool (mappings only) and pairs -----
+            parent_maps: List[Dict[str,str]] = [m for (_sc, m) in filtered_pairs][:cfg["parent_pool"]]
+            n_par = len(parent_maps)
+            if n_par >= 2:
+                pairs = [(parent_maps[i], parent_maps[j]) for i in range(n_par) for j in range(i+1, n_par)]
+                random.shuffle(pairs)
+                max_pairs = max(1, min(len(pairs), cfg["parent_pool"] // 2))
+                pairs = pairs[:max_pairs]
+            else:
+                pairs = []
+
+            # ----- Children via crossover + repair -----
+            children: List[Dict[str,str]] = []
+            for pa, pb in pairs:
+                for _ in range(cfg["children_per_pair"]):
+                    child = crossover_child(pa, pb, symbols_sorted, votes=votes)
+                    child = repair_class_counts(child, target_counts, symbols_sorted, cfg["repair_max_swaps"])
+                    children.append(child)
+
+            # ----- Local neighbor refinement (mapping stays attached) -----
+            seeds = [consensus_map] + children
+            with cf.ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
+                futs: List[Tuple[Dict[str,str], "cf.Future"]] = []
+                for m0 in seeds:
+                    futs.append((m0, ex.submit(
+                        score_mapping, cipher, m0, word_freq, bigr,
+                        cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
+                    )))
+                    for nm in neighbors_swaps(m0, symbols_sorted, k=cfg["neighbors_per_map"]):
+                        futs.append((nm, ex.submit(
+                            score_mapping, cipher, nm, word_freq, bigr,
+                            cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
+                        )))
+                for m_candidate, fut in futs:
+                    try:
+                        s, p, morse = fut.result()
+                        new_candidates.append((s, m_candidate, p, morse))
+                    except Exception:
+                        pass  # ignore failed evaluations
+
+        # Merge old & new, dedupe by mapping, keep top N
+        pool = dedupe_keep_best(pool + new_candidates, cfg["consensus_top_from_each_round"])
+        if pool and pool[0][0] > best[0]:
+            best = pool[0]
+
+    return best, pool  # (score, mapping, plaintext, morse), final pool list
+
+# =======================
+# CSV export helpers (hotspot-centered previews)
+# =======================
+def _mapping_counts(mapping: Dict[str,str]) -> Tuple[int,int,int]:
+    c = Counter(mapping.values())
+    return c.get('.',0), c.get('-',0), c.get('/',0)
+
+def export_candidates_csv(path: str,
+                          results: List[Tuple[float, Dict[str,str], str, str]],
+                          cipher: str,
+                          tgt: MorseTargets,
+                          max_rows: int = 50,
+                          preview_chars: int = 240,
+                          preview_window_morse: int = 800) -> None:
+    rows = []
+    for score, mapping, _plaintext_full, _morse_full in results[:max_rows]:
+        d,h,s = _mapping_counts(mapping)
+        # hotspot-centered short preview for CSV
+        prev_plain, _, _ = preview_centered_on_hotspot(
+            cipher, mapping, tgt,
+            window_morse=preview_window_morse,
+            preview_chars=preview_chars
+        )
+        rows.append({
+            "score": f"{score:.6f}",
+            "dots": d, "dashes": h, "seps": s,
+            "mapping": " ".join(f"{k}:{v}" for k,v in sorted(mapping.items())),
+            "preview": (prev_plain or "").replace("\n"," "),
+        })
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["score","dots","dashes","seps","mapping","preview"])
+        w.writeheader(); w.writerows(rows)
+
+# =======================
+# Main
+# =======================
 def main():
     cfg = CONFIG
-
-    # Load ciphertext
-    if cfg["ciphertext"] is not None and len(str(cfg["ciphertext"]).strip()) > 0:
-        ciphertext = str(cfg["ciphertext"]).strip()
+    if cfg["ciphertext"] is not None:
+        ciphertext = cfg["ciphertext"].strip().lower()
     else:
-        with open(cfg["ciphertext_file"], 'r', encoding='utf-8', errors='ignore') as fh:
-            ciphertext = fh.read().strip()
+        with open(cfg["ciphertext_file"], "r", encoding="utf-8", errors="ignore") as fh:
+            ciphertext = fh.read().strip().lower()
 
-    # 1) Build n-grams
-    words, word_freqs, diag = clean_and_build_ngrams(cfg["corpus"],
-                                                     n_range=(cfg["nmin"], cfg["nmax"]),
-                                                     top_k=cfg["topk"],
-                                                     min_count=cfg["min_count"],
-                                                     min_token_len=cfg["min_token_len"])
-    print(f"[pipeline] ngrams: {len(words)}, diagnostics: {diag}")
+    # Keep only [a-z0-9]
+    ciphertext = "".join(ch for ch in ciphertext if ch in ALNUM)
+    symbols = sorted(set(ciphertext))
 
-    # 2) Build patterns and scan (threaded)
-    patterns = decoder_build_patterns(words)
-    print("[pipeline] scanning ciphertext (threaded)...")
-    cand_sets = parallel_scan_threaded(ciphertext, words, patterns,
-                                       chunk_size=cfg["chunk_size"],
-                                       max_workers=cfg["max_workers"])
+    print(f"[INFO] Torch={_TORCH} backend={_TORCH_BACKEND} device={_TORCH_DEVICE} | NumPy={_NUMPY} | Threads={cfg['threads']}")
 
-    # 3) Merge candidates and decode+score
-    merged = merge_candidate_sets(cand_sets)
-    results = decode_and_score(ciphertext, merged, words, word_freqs)
-    print(f"[pipeline] decoder produced {len(results)} scored mappings")
-    top = results[:cfg["take_top_cands"]]
+    # Build corpus models & Morse targets
+    print("[INFO] Building corpus models …")
+    word_freq, bigr = build_word_freq_and_char_bigrams(cfg["corpus_dir"])
+    print(f"  unique words={len(word_freq):,}  |  char bigrams={len(bigr):,}")
 
-    # Save CSV (best effort)
-    try:
-        export_results(results, words, export_dir='decoder_exports', export_k=200)
-    except Exception as e:
-        print(f"[warn] export failed: {e}")
+    print("[INFO] Building Morse targets …")
+    targets = build_morse_targets(word_freq,
+                                  top_n=cfg["targets_top_words"],
+                                  min_len=cfg["targets_min_len"],
+                                  max_len=cfg["targets_max_len"])
+    tgt = MorseTargets(targets, alpha=cfg["ngram_weight_alpha"], normalize=cfg["ngram_weight_norm"])
+    if targets:
+        lens = sorted(len(x) for x in targets)
+        print(f"  target lengths: {lens[:5]} … {lens[-5:]} (total={len(targets)})")
+    else:
+        print("  [warn] no targets built; scoring will rely on LM components and priors only")
 
-    # 4) Build constraints from top decoder mappings
-    constraints = constraints_from_candidates(top, top=cfg["take_top_cands"],
-                                              require_unanimous=cfg["require_unanimous"])
-    print(f"[pipeline] constraints (from decoder): {constraints}")
+    # Parallel search (gather many results)
+    print("[INFO] Searching (parallel random starts) …")
+    all_results = pollux_search_all(ciphertext, symbols, word_freq, bigr, cfg, tgt)
+    if not all_results:
+        print("[ERR] No results produced.")
+        return
+    best_initial = all_results[0]
+    print(f"[INFO] Best initial score: {best_initial[0]:.4f}")
 
-    # 5) Build morse targets for optimizer
-    base_targets = [
-        ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..",
-        ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.",
-        "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--.."
-    ]
-    base_targets += [''.join(t) for t in itertools.permutations(['.', '-'], 3)]
-    ngram_targets = [convert_morse_classes_to_optimizer(morse_pattern_for_phrase(w)) for w in words[:CONFIG.get('targets_top_ngram', 200)]]
-    morse_targets = base_targets + [t for t in ngram_targets if t]
+    # Consensus + refinement iterations
+    print("[INFO] Refining with consensus + crossover + repair …")
+    best_tuple, final_pool = refine_consensus(
+        ciphertext, symbols, cfg["class_splits"], word_freq, bigr, cfg, tgt, all_results
+    )
+    best_score, best_map, best_plain, best_morse = best_tuple
 
-    # 6) Optimize with constraints (threaded + GPU/NumPy scoring)
-    best_map, best_score = optimize_with_constraints(
-        ciphertext, morse_targets, constraints,
-        n_processes=cfg.get("opt_procs", CONFIG["threads"]),
-        max_evaluations=cfg["opt_max_evals"],
-        threshold=cfg["opt_threshold"],
-        verbose=True
+    # Hotspot-centered preview (final)
+    preview_plain, preview_morse, hotspot = preview_centered_on_hotspot(
+        ciphertext, best_map, tgt,
+        window_morse=cfg["preview_window_morse"],
+        preview_chars=cfg["preview_chars"]
     )
 
-    # 7) Decode final plaintext
-    if best_map:
-        plaintext, morse_seq = decode_with_mapping(ciphertext, best_map)
-    else:
-        best_map, best_score = {}, 0.0
-        plaintext, morse_seq = "", ""
+    # Export CSVs (optional) — with hotspot-centered per-row previews
+    if cfg.get("export_csv", False):
+        try:
+            export_candidates_csv(
+                cfg.get("export_path_initial", "candidates_initial.csv"),
+                all_results,
+                cipher=ciphertext,
+                tgt=tgt,
+                max_rows=cfg.get("export_top_k", 50),
+                preview_chars=cfg.get("export_preview_chars", 240),
+                preview_window_morse=cfg.get("export_preview_window_morse", 800),
+            )
+        except Exception as e:
+            print("[warn] could not export initial CSV:", e)
+        try:
+            export_candidates_csv(
+                cfg.get("export_path_refined", "candidates_refined.csv"),
+                final_pool,
+                cipher=ciphertext,
+                tgt=tgt,
+                max_rows=cfg.get("export_top_k", 50),
+                preview_chars=cfg.get("export_preview_chars", 240),
+                preview_window_morse=cfg.get("export_preview_window_morse", 800),
+            )
+        except Exception as e:
+            print("[warn] could not export refined CSV:", e)
 
-    print("\n=== PIPELINE RESULT ===")
-    print(f"Device: {_TORCH_DEVICE if _TORCH else ('numpy' if _NUMPY else 'python')}  |  Threads: {CONFIG.get('threads')}")
-    print(f"Best optimizer score: {best_score:.4f}")
-    print(f"Best mapping: {best_map}")
-    print(f"Decoded preview (first 500 chars):\n{plaintext[:500]}")
+    print("\n=== RESULT ===")
+    print(f"Device: {('torch:'+_TORCH_BACKEND+':'+_TORCH_DEVICE) if _TORCH else ('numpy' if _NUMPY else 'python')}")
+    print(f"Score:  {best_score:.4f}")
+    print(f"Mapping (symbol→class): {best_map}")
+    print(f"[Hotspot] morse index: {hotspot}  |  morse slice (first 200): {preview_morse[:200]}")
+    print(f"Plaintext preview (centered on hotspot, up to {cfg['preview_chars']} chars):\n{preview_plain}")
 
 if __name__ == "__main__":
+    if CONFIG["seed"] is not None:
+        random.seed(CONFIG["seed"])
     main()
-# ==== END Glue & Pipeline (no CLI) ====
