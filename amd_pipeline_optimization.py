@@ -24,10 +24,10 @@ from collections import Counter, defaultdict
 # Environment & Backends
 # =======================
 # Max out BLAS threads for NumPy
-os.environ.setdefault("OMP_NUM_THREADS", "16")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
-os.environ.setdefault("MKL_NUM_THREADS", "16")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "16")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "8")
 
 _TORCH = False
 _NUMPY = False
@@ -67,10 +67,10 @@ CONFIG = {
     "corpus_dir": "./corpus",           # Directory containing *.txt files
 
     # ---------- Parallel search ----------
-    "threads": 16,                      # ThreadPool size (5800X3D -> 16 logical threads)
+    "threads": 8,                      # ThreadPool size (5800X3D -> 16 logical threads)
     "random_starts": 96,                # Starts per class-split (raise cautiously)
     "hill_steps": 5000,                 # Swap attempts per start
-    "seed": 42,                         # RNG seed (or None)
+    "seed": None,                         # RNG seed (or None)
 
     # ---------- Class-count splits (dots, dashes) ----------
     # The remaining symbols become '/'
@@ -79,12 +79,12 @@ CONFIG = {
     # ---------- Language model weights ----------
     "lm_word_weight": 1.0,              # Word-frequency likelihood
     "lm_char_weight": 1.0,              # Character bigram likelihood
-    "word_min_len": 2,                  # Ignore short words (except 'a', 'i')
+    "word_min_len": 3,                  # Ignore short words (except 'a', 'i')
 
     # ---------- Morse n-gram targets ----------
-    "targets_top_words": 4000,          # Top-N corpus words to convert to Morse targets
+    "targets_top_words": 2500,          # Top-N corpus words to convert to Morse targets
     "targets_min_len": 1,               # Minimum Morse length of target
-    "targets_max_len": 14,              # Maximum Morse length (longer => more compute)
+    "targets_max_len": 7,              # Maximum Morse length (longer => more compute)
     "ngram_weight_alpha": 1.3,          # Weight(L) = L ** alpha (favor longer n-grams)
     "ngram_weight_norm": True,          # Normalize weights across lengths
 
@@ -93,20 +93,20 @@ CONFIG = {
 
     # ---------- Consensus refinement ----------
     "topK_global": 48,                  # Top-K mappings gathered from parallel starts
-    "consensus_rounds": 4,              # Refinement iterations
-    "consensus_top_from_each_round": 48,# Carry this many into the next round
-    "parent_pool": 24,                  # Parents considered for crossover
+    "consensus_rounds": 3,              # Refinement iterations
+    "consensus_top_from_each_round": 40,# Carry this many into the next round
+    "parent_pool": 16,                  # Parents considered for crossover
     "children_per_pair": 2,             # Children spawned per parent pair
-    "neighbors_per_map": 1500,          # Local neighbor proposals per mapping per round
-    "repair_max_swaps": 200,            # Max swaps during class-count repair
+    "neighbors_per_map": 800,          # Local neighbor proposals per mapping per round
+    "repair_max_swaps": 100,            # Max swaps during class-count repair
     "consensus_symbol_min_vote": 0.0,   # Minimal vote to accept a symbol class
 
     # ---------- Preview ----------
     "preview_chars": 600,               # Length of final plaintext preview
-    "preview_window_morse": 2000,       # Morse window around hotspot to convert for preview
+    "preview_window_morse": 1200,       # Morse window around hotspot to convert for preview
 
     # ---------- Logging ----------
-    "log_every": 200,                   # Print progress at most this often (per start)
+    "log_every": 250,                   # Print progress at most this often (per start)
 }
 
 ALNUM = set(string.ascii_lowercase + string.digits)
@@ -619,6 +619,64 @@ def refine_consensus(cipher: str, symbols: List[str], splits: List[Tuple[int,int
                         s, p, morse = fut.result()
                         new_candidates.append((s, None, p, morse))  # map to be filled later
                     except Exception as e:
+                        pass
+
+            # backfill mappings for those without map (re-score cheaper than storing huge list)
+            filled = []
+            for s, m, p, morse in new_candidates:
+                if m is None:
+                    # re-derive by hill climbing a few steps from consensus (cheap heuristic)
+                    # (or skip; but we prefer to know mapping—here we’ll skip to keep RAM sane)
+                    filled.append((s, consensus_map, p, morse))
+                else:
+                    filled.append((s, m, p, morse))
+            new_candidates = filled
+
+            # votes to guide crossover (use only filtered parents that roughly match this split)
+            wsum = sum(max(0.0, sc) for sc, _ in filtered_pairs) + 1e-9
+            votes = {sym: {'.':0.0, '-':0.0, '/':0.0} for sym in symbols_sorted}
+            for sc, mp in filtered_pairs:
+                w = max(0.0, sc) / wsum
+                for sym in symbols_sorted:
+                    votes[sym][mp.get(sym, '/')] += w
+
+            # parent pool (mappings only) drawn from filtered pool to keep counts coherent
+            parent_maps = [m for (sc, m) in filtered_pairs][:cfg["parent_pool"]]
+            n_par = len(parent_maps)
+            pairs = [(parent_maps[i], parent_maps[j]) for i in range(n_par) for j in range(i+1, n_par)]
+            random.shuffle(pairs)
+            # limit number of parent pairs to try
+            max_pairs = max(1, min(len(pairs), cfg["parent_pool"] // 2))
+            pairs = pairs[:max_pairs]
+
+            children = []
+            for pa, pb in pairs:
+                for _ in range(cfg["children_per_pair"]):
+                    child = crossover_child(pa, pb, symbols_sorted, votes=votes)
+                    child = repair_class_counts(child, target_counts, symbols_sorted, cfg["repair_max_swaps"])
+                    children.append(child)
+
+            # local neighbor refinement (keep mapping attached to each future)
+            with cf.ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
+                futs = []
+                seeds = [consensus_map] + children
+                for m0 in seeds:
+                    futs.append((m0, ex.submit(
+                        score_mapping, cipher, m0, word_freq, bigr,
+                        cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
+                    )))
+                    # neighbors
+                    neighs = neighbors_swaps(m0, symbols_sorted, k=cfg["neighbors_per_map"])
+                    for nm in neighs:
+                        futs.append((nm, ex.submit(
+                            score_mapping, cipher, nm, word_freq, bigr,
+                            cfg["lm_word_weight"], cfg["lm_char_weight"], cfg["word_min_len"], tgt
+                        )))
+                for m_candidate, fut in futs:
+                    try:
+                        s, p, morse = fut.result()
+                        new_candidates.append((s, m_candidate, p, morse))
+                    except Exception:
                         pass
 
             # backfill mappings for those without map (re-score cheaper than storing huge list)
